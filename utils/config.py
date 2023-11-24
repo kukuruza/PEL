@@ -2,9 +2,16 @@ from yacs.config import CfgNode as CN
 
 _C = CN()
 
-_C.dataset = ""  # Dataset name
-_C.root = ""  # Directory where datasets are stored
-_C.imb_factor = None  # for long-tailed cifar dataset
+# _C.dataset = ""  # Dataset name
+# _C.root = ""  # Directory where datasets are stored
+# _C.imb_factor = None  # for long-tailed cifar dataset
+
+_C.train_db_file = None
+_C.test_db_file = None
+_C.encoding_file = None
+_C.rootdir = None
+_C.debug_num_train_classes = 0
+_C.debug_no_albumentation = False
 
 _C.backbone = ""
 _C.resolution = 224
@@ -14,7 +21,7 @@ _C.print_freq = 10  # How often (batch) to print training information
 
 _C.seed = None  # use manual seed
 _C.deterministic = False  # output deterministic results
-_C.gpu = None  # assign a single gpu 
+_C.gpu = None  # assign a single gpu
 _C.num_workers = 20
 _C.prec = "fp16"  # fp16, fp32, amp
 
@@ -30,7 +37,7 @@ _C.classifier = "CosineClassifier"
 _C.scale = 25  # for cosine classifier
 
 _C.full_tuning = False  # full fine-tuning
-_C.bias_tuning = False  # only fine-tuning the bias 
+_C.bias_tuning = False  # only fine-tuning the bias
 _C.ln_tuning = False  # only fine-tuning the layer norm
 _C.bn_tuning = False  # only fine-tuning the batch norm (only for resnet)
 _C.vpt_shallow = False
@@ -47,7 +54,7 @@ _C.adapter_dim = None  # bottle dimension for adapter / adaptformer / lora.
 
 _C.init_head = None  # "text_feat" (only for CLIP) / "class_mean" / "1_shot" / "10_shot" / "100_shot" / "linear_probe"
 _C.test_ensemble = False  # test-time ensemble
-_C.expand = 24 # expand the width and height of images for test-time ensemble
+_C.expand = 24  # expand the width and height of images for test-time ensemble
 
 _C.zero_shot = False  # zero-shot CLIP (only for CLIP)
 _C.test_only = False  # load model and test

@@ -1,10 +1,17 @@
 import os
 import time
 import datetime
+import pprint
+import logging
+import progressbar
+import simplejson as json
+import cv2
 import numpy as np
 from tqdm import tqdm
 from collections import OrderedDict
 from sklearn.linear_model import LogisticRegression
+import albumentations as A
+from albumentations.pytorch.transforms import ToTensorV2
 
 import torch
 import torch.nn as nn
@@ -17,7 +24,8 @@ from torchvision import transforms
 from clip import clip
 from timm.models.vision_transformer import vit_base_patch16_224
 
-import datasets
+from shuffler.interface.pytorch import datasets
+
 from models import *
 
 from utils.meter import AverageMeter
@@ -29,7 +37,8 @@ from utils.evaluator import Evaluator
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.backbone.lstrip("CLIP-")
     url = clip._MODELS[backbone_name]
-    model_path = clip._download(url)
+    model_path = clip._download(
+        url, root="/ocean/projects/hum210002p/shared/classification/cache")
 
     try:
         # loading JIT archive
@@ -58,12 +67,32 @@ def load_vit_to_cpu(cfg):
     if cfg.prec == "fp16":
         # ViT's default precision is fp32
         model.half()
-    
+
     return model
 
 
+def load_decoding(encoding_file):
+    # Read the encoding, and pprepare the decoding table.
+    if not os.path.exists(encoding_file):
+        raise FileNotFoundError('Cant find the encoding file: %s' %
+                                encoding_file)
+    with open(encoding_file) as f:
+        encoding = json.load(f)
+    decoding = {}
+    for name, name_id in encoding.items():
+        if name_id == -1:
+            assert False
+            decoding[name_id] = None
+        elif name_id in decoding:
+            raise ValueError('Not expecting multiple back mapping.')
+        else:
+            decoding[name_id] = name
+    print('Have %d entries in decoding.' % len(decoding))
+    return decoding
+
+
 class Trainer:
-    def __init__(self, cfg):
+    def __init__(self, cfg, is_inference=False):
 
         if not torch.cuda.is_available():
             self.device = torch.device("cpu")
@@ -74,70 +103,145 @@ class Trainer:
             self.device = torch.device("cuda:{}".format(cfg.gpu))
 
         self.cfg = cfg
-        self.build_data_loader()
+
+        self.decoding = load_decoding(cfg.encoding_file)
+        self.classnames = [value for _, value in self.decoding.items()]
+
+        if is_inference:
+            self.build_inference_data_loader()
+        else:
+            self.build_training_data_loader()
+            self.evaluator = Evaluator(cfg, self.many_idxs, self.med_idxs,
+                                       self.few_idxs)
+
         self.build_model()
-        self.evaluator = Evaluator(cfg, self.many_idxs, self.med_idxs, self.few_idxs)
         self._writer = None
 
-    def build_data_loader(self):
+    def build_training_data_loader(self):
         cfg = self.cfg
-        root = cfg.root
         resolution = cfg.resolution
-        expand = cfg.expand
 
-        if cfg.backbone.startswith("CLIP"):
-            mean = [0.48145466, 0.4578275, 0.40821073]
-            std = [0.26862954, 0.26130258, 0.27577711]
+        if cfg.debug_no_albumentation:
+            train_image_transform = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.RandomResizedCrop(resolution),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406],
+                                     [0.229, 0.224, 0.225]),
+            ])
         else:
-            mean = [0.5, 0.5, 0.5]
-            std = [0.5, 0.5, 0.5]
-        print("mean:", mean)
-        print("std:", std)
-
-        transform_train = transforms.Compose([
-            transforms.RandomResizedCrop(resolution),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean, std),
-        ])
-
-        transform_plain = transforms.Compose([
-            transforms.Resize(resolution),
+            albumentation_tranform = A.Compose([
+                A.CLAHE(),
+                A.ShiftScaleRotate(shift_limit=0.1,
+                                   scale_limit=(0, 0.35),
+                                   rotate_limit=20,
+                                   p=1.,
+                                   border_mode=cv2.BORDER_REPLICATE),
+                A.Blur(blur_limit=1),
+                A.OpticalDistortion(),
+                A.GridDistortion(),
+                A.Resize(224, 224),
+                A.HueSaturationValue(),
+                A.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
+                ToTensorV2(),
+            ])
+            train_image_transform = lambda x: albumentation_tranform(image=x)[
+                'image']
+        test_image_transform = transforms.Compose([
+            transforms.ToPILImage(),
             transforms.CenterCrop(resolution),
             transforms.ToTensor(),
-            transforms.Normalize(mean, std),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
 
-        if cfg.test_ensemble:
-            transform_test = transforms.Compose([
-                transforms.Resize(resolution + expand),
-                transforms.FiveCrop(resolution),
-                transforms.Lambda(lambda crops: torch.stack([transforms.ToTensor()(crop) for crop in crops])),
-                transforms.Normalize(mean, std),
-            ])
-        else:
-            transform_test = transforms.Compose([
-                transforms.Resize(resolution * 8 // 7),
-                transforms.CenterCrop(resolution),
-                transforms.Lambda(lambda crop: torch.stack([transforms.ToTensor()(crop)])),
-                transforms.Normalize(mean, std),
-            ])
+        used_keys = [
+            'imagefile', 'image', 'objectid', 'name_id', 'name', 'x_on_page',
+            'width_on_page', 'y_on_page', 'height_on_page'
+        ]
+        common_transform_group = {
+            'name_id':
+            lambda x: int(x),
+            'x_on_page':
+            lambda x: float(x) if x is not None and x != 'None' else -1,
+            'y_on_page':
+            lambda x: float(x) if x is not None and x != 'None' else -1,
+            'width_on_page':
+            lambda x: float(x) if x is not None and x != 'None' else -1,
+            'height_on_page':
+            lambda x: float(x) if x is not None and x != 'None' else -1,
+        }
+        train_transform_group = dict(common_transform_group)
+        train_transform_group.update({'image': train_image_transform})
+        test_transform_group = dict(common_transform_group)
+        test_transform_group.update({'image': test_image_transform})
 
-        train_dataset = getattr(datasets, cfg.dataset)(root, train=True, transform=transform_train)
-        train_init_dataset = getattr(datasets, cfg.dataset)(root, train=True, transform=transform_plain)
-        train_test_dataset = getattr(datasets, cfg.dataset)(root, train=True, transform=transform_test)
-        test_dataset = getattr(datasets, cfg.dataset)(root, train=False, transform=transform_test)
+        # Limit the number of objects.
+        object_id_sql_clause = (
+            'objectid IN '
+            '(SELECT objectid FROM properties WHERE key = "name_id" '
+            'AND CAST(value AS INT) < "%d")' % cfg.debug_num_train_classes)
+        names_and_count_sql = (
+            'SELECT DISTINCT(name),COUNT(1) FROM objects '
+            'JOIN properties ON objects.objectid = properties.objectid '
+            'WHERE key = "name_id" AND CAST(value AS INT) < "%d"'
+            'GROUP BY name ORDER BY CAST(value AS INT)' %
+            cfg.debug_num_train_classes)
 
-        self.num_classes = train_dataset.num_classes
-        self.cls_num_list = train_dataset.cls_num_list
-        self.classnames = train_dataset.classnames
+        train_dataset = datasets.ObjectDataset(
+            cfg.train_db_file,
+            rootdir=cfg.rootdir,
+            where_object=object_id_sql_clause,
+            mode='r',
+            used_keys=used_keys,
+            transform_group=train_transform_group)
+        print("Total number of train samples:", len(train_dataset))
 
-        if cfg.dataset in ["CIFAR100", "CIFAR100_IR10", "CIFAR100_IR50"]:
-            split_cls_num_list = datasets.CIFAR100_IR100(root, train=True).cls_num_list
-        else:
-            split_cls_num_list = self.cls_num_list
+        train_init_dataset = datasets.ObjectDataset(
+            cfg.train_db_file,
+            rootdir=cfg.rootdir,
+            where_object=object_id_sql_clause,
+            mode='r',
+            used_keys=used_keys,
+            transform_group=train_transform_group)
+
+        train_test_dataset = datasets.ObjectDataset(
+            cfg.train_db_file,
+            rootdir=cfg.rootdir,
+            where_object=object_id_sql_clause,
+            mode='r',
+            used_keys=used_keys,
+            transform_group=test_transform_group)
+
+        # Set num_classes everywhere.
+        names_and_count = train_dataset.execute(names_and_count_sql)
+        classnames, cls_num_list = zip(*names_and_count)
+        # pprint.pprint(names_and_count)
+        num_classes = len(classnames)
+        print('num_classes:', num_classes)
+
+        # Test dataset needs to have classes present in training dataset.
+        names_str = "'" + "', '".join(classnames) + "'"
+        # print('Querying the test database for:', names_str)
+        test_dataset = datasets.ObjectDataset(
+            cfg.test_db_file,
+            rootdir=cfg.rootdir,
+            where_object="name IN (%s)" % names_str,
+            mode='r',
+            used_keys=used_keys,
+            transform_group=test_transform_group)
+        print("Total number of test samples:", len(test_dataset))
+
+        self.num_classes = num_classes
+        self.cls_num_list = cls_num_list
+        self.classnames = classnames
+
+        split_cls_num_list = self.cls_num_list
         self.many_idxs = (np.array(split_cls_num_list) > 100).nonzero()[0]
-        self.med_idxs = ((np.array(split_cls_num_list) >= 20) & (np.array(split_cls_num_list) <= 100)).nonzero()[0]
+        self.med_idxs = ((np.array(split_cls_num_list) >= 20) &
+                         (np.array(split_cls_num_list) <= 100)).nonzero()[0]
         self.few_idxs = (np.array(split_cls_num_list) < 20).nonzero()[0]
 
         if cfg.init_head == "1_shot":
@@ -150,26 +254,79 @@ class Trainer:
             init_sampler = None
 
         self.train_loader = DataLoader(train_dataset,
-            batch_size=cfg.micro_batch_size, shuffle=True,
-            num_workers=cfg.num_workers, pin_memory=True)
+                                       batch_size=cfg.micro_batch_size,
+                                       shuffle=True,
+                                       num_workers=cfg.num_workers,
+                                       pin_memory=True)
 
         self.train_init_loader = DataLoader(train_init_dataset,
-            batch_size=64, sampler=init_sampler, shuffle=False,
-            num_workers=cfg.num_workers, pin_memory=True)
+                                            batch_size=64,
+                                            sampler=init_sampler,
+                                            shuffle=False,
+                                            num_workers=cfg.num_workers,
+                                            pin_memory=True)
 
         self.train_test_loader = DataLoader(train_test_dataset,
-            batch_size=64, shuffle=False,
-            num_workers=cfg.num_workers, pin_memory=True)
+                                            batch_size=64,
+                                            shuffle=False,
+                                            num_workers=cfg.num_workers,
+                                            pin_memory=True)
 
         self.test_loader = DataLoader(test_dataset,
-            batch_size=64, shuffle=False,
-            num_workers=cfg.num_workers, pin_memory=True)
-        
+                                      batch_size=64,
+                                      shuffle=False,
+                                      num_workers=cfg.num_workers,
+                                      pin_memory=True)
+
         assert cfg.batch_size % cfg.micro_batch_size == 0
         self.accum_step = cfg.batch_size // cfg.micro_batch_size
 
         print("Total training points:", sum(self.cls_num_list))
         # print(self.cls_num_list)
+
+    def build_inference_data_loader(self):
+        cfg = self.cfg
+        resolution = cfg.resolution
+
+        test_image_transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.CenterCrop(resolution),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+
+        used_keys = [
+            'imagefile', 'image', 'objectid', 'name_id', 'name', 'x_on_page',
+            'width_on_page', 'y_on_page', 'height_on_page'
+        ]
+        common_transform_group = {
+            'name_id':
+            lambda x: int(x) if x is not None and x != 'None' else -1,
+            'x_on_page':
+            lambda x: float(x) if x is not None and x != 'None' else -1,
+            'y_on_page':
+            lambda x: float(x) if x is not None and x != 'None' else -1,
+            'width_on_page':
+            lambda x: float(x) if x is not None and x != 'None' else -1,
+            'height_on_page':
+            lambda x: float(x) if x is not None and x != 'None' else -1,
+        }
+        test_transform_group = dict(common_transform_group)
+        test_transform_group.update({'image': test_image_transform})
+
+        # with open(args.encoding_file, 'r') as f:
+        #     encoding = json.loads(f.read())
+        # model.name_encoding = encoding
+
+        # Test dataset needs to have classes present in training dataset.
+        self.inference_dataset = datasets.ObjectDataset(
+            cfg.test_db_file,
+            rootdir=cfg.rootdir,
+            mode='w',
+            used_keys=used_keys,
+            transform_group=test_transform_group,
+            copy_to_memory=False)
+        print("Total number of test samples:", len(self.inference_dataset))
 
     def build_model(self):
         cfg = self.cfg
@@ -211,20 +368,24 @@ class Trainer:
 
             if cfg.init_head == "text_feat":
                 self.init_head_text_feat()
-            elif cfg.init_head in ["class_mean", "1_shot", "10_shot", "100_shot"]:
+            elif cfg.init_head in [
+                    "class_mean", "1_shot", "10_shot", "100_shot"
+            ]:
                 self.init_head_class_mean()
             elif cfg.init_head == "linear_probe":
                 self.init_head_linear_probe()
             else:
                 print("No initialization with head")
-            
+
             torch.cuda.empty_cache()
-        
+
         # Note that multi-gpu training could be slow because CLIP's size is
         # big, which slows down the copy operation in DataParallel
         device_count = torch.cuda.device_count()
         if device_count > 1 and cfg.gpu is None:
-            print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
+            print(
+                f"Multiple GPUs detected (n_gpus={device_count}), use all of them!"
+            )
             self.model = nn.DataParallel(self.model)
 
     def build_optimizer(self):
@@ -251,10 +412,16 @@ class Trainer:
         #     print(name, param.numel())
 
         # NOTE: only give tuner and head to the optimizer
-        self.optim = torch.optim.SGD([{"params": self.tuner.parameters()},
-                                      {"params": self.head.parameters()}],
-                                      lr=cfg.lr, weight_decay=cfg.weight_decay, momentum=cfg.momentum)
-        self.sched = torch.optim.lr_scheduler.CosineAnnealingLR(self.optim, cfg.num_epochs)
+        self.optim = torch.optim.SGD([{
+            "params": self.tuner.parameters()
+        }, {
+            "params": self.head.parameters()
+        }],
+                                     lr=cfg.lr,
+                                     weight_decay=cfg.weight_decay,
+                                     momentum=cfg.momentum)
+        self.sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optim, cfg.num_epochs)
         self.scaler = GradScaler() if cfg.prec == "amp" else None
 
     def build_criterion(self):
@@ -263,21 +430,21 @@ class Trainer:
 
         if cfg.loss_type == "CE":
             self.criterion = nn.CrossEntropyLoss()
-        elif cfg.loss_type == "Focal": # https://arxiv.org/abs/1708.02002
+        elif cfg.loss_type == "Focal":  # https://arxiv.org/abs/1708.02002
             self.criterion = FocalLoss()
-        elif cfg.loss_type == "LDAM": # https://arxiv.org/abs/1906.07413
+        elif cfg.loss_type == "LDAM":  # https://arxiv.org/abs/1906.07413
             self.criterion = LDAMLoss(cls_num_list=cls_num_list, s=cfg.scale)
-        elif cfg.loss_type == "CB": # https://arxiv.org/abs/1901.05555
+        elif cfg.loss_type == "CB":  # https://arxiv.org/abs/1901.05555
             self.criterion = ClassBalancedLoss(cls_num_list=cls_num_list)
-        elif cfg.loss_type == "GRW": # https://arxiv.org/abs/2103.16370
+        elif cfg.loss_type == "GRW":  # https://arxiv.org/abs/2103.16370
             self.criterion = GeneralizedReweightLoss(cls_num_list=cls_num_list)
-        elif cfg.loss_type == "BS": # https://arxiv.org/abs/2007.10740
+        elif cfg.loss_type == "BS":  # https://arxiv.org/abs/2007.10740
             self.criterion == BalancedSoftmaxLoss(cls_num_list=cls_num_list)
-        elif cfg.loss_type == "LA": # https://arxiv.org/abs/2007.07314
+        elif cfg.loss_type == "LA":  # https://arxiv.org/abs/2007.07314
             self.criterion = LogitAdjustedLoss(cls_num_list=cls_num_list)
-        elif cfg.loss_type == "LADE": # https://arxiv.org/abs/2012.00321
+        elif cfg.loss_type == "LADE":  # https://arxiv.org/abs/2012.00321
             self.criterion = LADELoss(cls_num_list=cls_num_list)
-        
+
     def get_tokenized_prompts(self, classnames):
         template = "a photo of a {}."
         prompts = [template.format(c.replace("_", " ")) for c in classnames]
@@ -327,12 +494,14 @@ class Trainer:
         all_features = all_features[sorted_index]
         all_labels = all_labels[sorted_index]
 
-        unique_labels, label_counts = torch.unique(all_labels, return_counts=True)
+        unique_labels, label_counts = torch.unique(all_labels,
+                                                   return_counts=True)
 
         class_means = [None] * self.num_classes
         idx = 0
         for i, cnt in zip(unique_labels, label_counts):
-            class_means[i] = all_features[idx: idx+cnt].mean(dim=0, keepdim=True)
+            class_means[i] = all_features[idx:idx + cnt].mean(dim=0,
+                                                              keepdim=True)
             idx += cnt
         class_means = torch.cat(class_means, dim=0)
         class_means = F.normalize(class_means, dim=-1)
@@ -360,8 +529,13 @@ class Trainer:
         all_features = torch.cat(all_features, dim=0).cpu()
         all_labels = torch.cat(all_labels, dim=0).cpu()
 
-        clf = LogisticRegression(solver="lbfgs", max_iter=100, penalty="l2", class_weight="balanced").fit(all_features, all_labels)
-        class_weights = torch.from_numpy(clf.coef_).to(all_features.dtype).to(self.device)
+        clf = LogisticRegression(solver="lbfgs",
+                                 max_iter=100,
+                                 penalty="l2",
+                                 class_weight="balanced").fit(
+                                     all_features, all_labels)
+        class_weights = torch.from_numpy(clf.coef_).to(all_features.dtype).to(
+            self.device)
         class_weights = F.normalize(class_weights, dim=-1)
 
         self.head.apply_weight(class_weights)
@@ -394,8 +568,8 @@ class Trainer:
             for batch_idx, batch in enumerate(self.train_loader):
                 data_time.update(time.time() - end)
 
-                image = batch[0]
-                label = batch[1]
+                image = batch['image']
+                label = batch['name_id']
                 image = image.to(self.device)
                 label = label.to(self.device)
 
@@ -405,7 +579,8 @@ class Trainer:
                         loss = self.criterion(output, label)
                         loss_micro = loss / self.accum_step
                         self.scaler.scale(loss_micro).backward()
-                    if ((batch_idx + 1) % self.accum_step == 0) or (batch_idx + 1 == num_batches):
+                    if ((batch_idx + 1) % self.accum_step
+                            == 0) or (batch_idx + 1 == num_batches):
                         self.scaler.step(self.optim)
                         self.scaler.update()
                         self.optim.zero_grad()
@@ -414,7 +589,8 @@ class Trainer:
                     loss = self.criterion(output, label)
                     loss_micro = loss / self.accum_step
                     loss_micro.backward()
-                    if ((batch_idx + 1) % self.accum_step == 0) or (batch_idx + 1 == num_batches):
+                    if ((batch_idx + 1) % self.accum_step
+                            == 0) or (batch_idx + 1 == num_batches):
                         self.optim.step()
                         self.optim.zero_grad()
 
@@ -442,38 +618,47 @@ class Trainer:
                 if meet_freq or only_few_batches:
                     nb_remain = 0
                     nb_remain += num_batches - batch_idx - 1
-                    nb_remain += (
-                        num_epochs - epoch_idx - 1
-                    ) * num_batches
+                    nb_remain += (num_epochs - epoch_idx - 1) * num_batches
                     eta_seconds = batch_time.avg * nb_remain
                     eta = str(datetime.timedelta(seconds=int(eta_seconds)))
 
                     info = []
                     info += [f"epoch [{epoch_idx + 1}/{num_epochs}]"]
                     info += [f"batch [{batch_idx + 1}/{num_batches}]"]
-                    info += [f"time {batch_time.val:.3f} ({batch_time.avg:.3f})"]
+                    info += [
+                        f"time {batch_time.val:.3f} ({batch_time.avg:.3f})"
+                    ]
                     info += [f"data {data_time.val:.3f} ({data_time.avg:.3f})"]
-                    info += [f"loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})"]
+                    info += [
+                        f"loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})"
+                    ]
                     info += [f"acc {acc_meter.val:.4f} ({acc_meter.avg:.4f})"]
-                    info += [f"(mean {mean_acc:.4f} many {many_acc:.4f} med {med_acc:.4f} few {few_acc:.4f})"]
+                    info += [
+                        f"(mean {mean_acc:.4f} many {many_acc:.4f} med {med_acc:.4f} few {few_acc:.4f})"
+                    ]
                     info += [f"lr {current_lr:.4e}"]
                     info += [f"eta {eta}"]
                     print(" ".join(info))
 
                 n_iter = epoch_idx * num_batches + batch_idx
                 self._writer.add_scalar("train/lr", current_lr, n_iter)
-                self._writer.add_scalar("train/loss.val", loss_meter.val, n_iter)
-                self._writer.add_scalar("train/loss.avg", loss_meter.avg, n_iter)
+                self._writer.add_scalar("train/loss.val", loss_meter.val,
+                                        n_iter)
+                self._writer.add_scalar("train/loss.avg", loss_meter.avg,
+                                        n_iter)
                 self._writer.add_scalar("train/acc.val", acc_meter.val, n_iter)
                 self._writer.add_scalar("train/acc.avg", acc_meter.avg, n_iter)
                 self._writer.add_scalar("train/mean_acc", mean_acc, n_iter)
                 self._writer.add_scalar("train/many_acc", many_acc, n_iter)
                 self._writer.add_scalar("train/med_acc", med_acc, n_iter)
                 self._writer.add_scalar("train/few_acc", few_acc, n_iter)
-                
+
                 end = time.time()
 
             self.sched.step()
+            torch.cuda.empty_cache()
+
+            self.test()
             torch.cuda.empty_cache()
 
         print("Finish training")
@@ -487,8 +672,6 @@ class Trainer:
 
         # save model
         self.save_model(cfg.output_dir)
-
-        self.test()
 
         # Close writer
         self._writer.close()
@@ -509,21 +692,17 @@ class Trainer:
             data_loader = self.test_loader
 
         for batch in tqdm(data_loader, ascii=True):
-            image = batch[0]
-            label = batch[1]
+            image = batch['image']
+            label = batch['name_id']
 
             image = image.to(self.device)
             label = label.to(self.device)
 
-            _bsz, _ncrops, _c, _h, _w = image.size()
-            image = image.view(_bsz * _ncrops, _c, _h, _w)
-
             output = self.model(image)
-            output = output.view(_bsz, _ncrops, -1).mean(dim=1)
 
             self.evaluator.process(output, label)
 
-        results = self.evaluator.evaluate()
+        results = self.evaluator.evaluate(self.num_classes)
 
         for k, v in results.items():
             tag = f"test/{k}"
@@ -532,13 +711,46 @@ class Trainer:
 
         return list(results.values())[0]
 
+    @torch.no_grad()
+    def inference(self, commit):
+        if self.tuner is not None:
+            self.tuner.eval()
+        if self.head is not None:
+            self.head.eval()
+
+        for sample in progressbar.progressbar(self.inference_dataset):
+            image = sample['image']
+            images = torch.unsqueeze(image, 0).to(self.device)
+            outputs = self.model(images)
+            assert len(outputs) == 1
+
+            pred = outputs.max(1)[1]
+            conf = torch.softmax(outputs, dim=1).max(1)[0]
+
+            pred = pred.data.cpu().numpy().tolist()
+            conf = conf.data.cpu().numpy().tolist()
+
+            objectid = int(sample['objectid'])
+            name_id = int(pred[0])
+            score = float(conf[0])
+            if name_id not in self.decoding:
+                raise ValueError('name_id %d not in decoding.')
+            name = self.decoding[name_id]
+            logging.debug(
+                'Setting name_id %s (name_id %d) with score %.3f to object %d',
+                name, name_id, score, objectid)
+            self.inference_dataset.execute(
+                'UPDATE objects SET name=?,score=? WHERE objectid=?',
+                (name, score, objectid))
+
+        if commit:
+            self.inference_dataset.conn.commit()
+        self.inference_dataset.close()
+
     def save_model(self, directory):
         tuner_dict = self.tuner.state_dict()
         head_dict = self.head.state_dict()
-        checkpoint = {
-            "tuner": tuner_dict,
-            "head": head_dict
-        }
+        checkpoint = {"tuner": tuner_dict, "head": head_dict}
 
         # remove 'module.' in state_dict's keys
         for key in ["tuner", "head"]:
@@ -559,7 +771,8 @@ class Trainer:
         load_path = os.path.join(directory, "checkpoint.pth.tar")
 
         if not os.path.exists(load_path):
-            raise FileNotFoundError('Checkpoint not found at "{}"'.format(load_path))
+            raise FileNotFoundError(
+                'Checkpoint not found at "{}"'.format(load_path))
 
         checkpoint = torch.load(load_path, map_location=self.device)
         tuner_dict = checkpoint["tuner"]

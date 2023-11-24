@@ -1,0 +1,3 @@
+rootdir: "/ocean/projects/hum210002p/shared/data"
+debug_num_train_classes: 10000
+debug_no_albumentation: False

@@ -6,3 +6,7 @@ tqdm
 ftfy
 regex
 timm
+opencv-python
+albumentations
+progressbar2
+

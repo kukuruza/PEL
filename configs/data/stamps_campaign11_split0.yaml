@@ -1,0 +1,6 @@
+train_db_file: "/ocean/projects/hum210002p/shared/databases/campaign11/crops/splits/campaign3to11-6Kx4K.v11.expand0.5.size260.cropped/split0/train.db"
+test_db_file: "/ocean/projects/hum210002p/shared/databases/campaign11/crops/splits/campaign3to11-6Kx4K.v11.expand0.5.size260.cropped/split0/validation.db"
+encoding_file: "/ocean/projects/hum210002p/shared/classification/campaign11/expand0.5.size260/run0/hyper001/encoding.json"
+rootdir: "/ocean/projects/hum210002p/shared/data"
+debug_num_train_classes: 10000
+debug_no_albumentation: False

@@ -1,13 +1,42 @@
 import os
 import random
 import argparse
+import shutil
 import numpy as np
 import torch
+import logging
 
 from utils.config import _C as cfg
 from utils.logger import setup_logger
 
 from trainer import Trainer
+
+
+def get_parser():
+    parser = argparse.ArgumentParser()
+    # parser.add_argument("--data_file",
+    #                     type=str,
+    #                     default="",
+    #                     help="data config file full path")
+    parser.add_argument("--model",
+                        "-m",
+                        type=str,
+                        default="",
+                        help="model config file")
+    parser.add_argument("--out_db_file",
+                        type=str,
+                        help="If specified, will write result here.")
+    parser.add_argument("opts",
+                        default=None,
+                        nargs=argparse.REMAINDER,
+                        help="modify config options using the command-line")
+    parser.add_argument(
+        "--logging_level",
+        type=int,
+        choices=[10, 20, 30, 40],
+        default=20,
+        help="Set logging level. 10: debug, 20: info, 30: warning, 40: error.")
+    return parser
 
 
 def main(args):
@@ -50,25 +79,23 @@ def main(args):
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
 
-    trainer = Trainer(cfg)
+    print("Model directory: {}".format(cfg.model_dir))
 
-    trainer.train()
+    if args.out_db_file is not None:
+        shutil.copyfile(cfg.test_db_file, args.out_db_file)
+        cfg.test_db_file = args.out_db_file
+
+    cfg.test_only = True
+
+    trainer = Trainer(cfg, is_inference=True)
+    trainer.load_model(cfg.model_dir)
+    trainer.inference(commit=(args.out_db_file is not None))
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    # parser.add_argument("--data_file",
-    #                     type=str,
-    #                     default="",
-    #                     help="data config file full path")
-    parser.add_argument("--model",
-                        "-m",
-                        type=str,
-                        default="",
-                        help="model config file")
-    parser.add_argument("opts",
-                        default=None,
-                        nargs=argparse.REMAINDER,
-                        help="modify config options using the command-line")
-    args = parser.parse_args()
+    args = get_parser().parse_args()
+    logging.basicConfig(
+        format='%(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',
+        level=args.logging_level)
+
     main(args)
